@@ -17,3 +17,14 @@ cli_binary: codebuddy
 # 日志
 log_level: info
 log_file: ./logs/orch.log
+
+# 乒乓循环编排
+pingpong:
+  max_rounds: 100
+  stop_keywords:
+    - "专利书编写完成"
+    - "PATENT_WRITING_DONE"
+  agent_a_name: reader
+  agent_b_name: writer
+  # agent_a_prompt: ""  # 空则使用内置默认 prompt
+  # agent_b_prompt: ""  # 空则使用内置默认 prompt

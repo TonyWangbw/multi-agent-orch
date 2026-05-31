@@ -11,6 +11,15 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// 乒乓循环运行状态常量
+const (
+	StatusCreated   = "created"
+	StatusRunning   = "running"
+	StatusCompleted = "completed"
+	StatusStopped   = "stopped"
+	StatusError     = "error"
+)
+
 // FlowDefinition 编排流程定义
 type FlowDefinition struct {
 	ID        string     `json:"id"`
@@ -43,6 +52,24 @@ type FlowNode struct {
 	CLIPid   int       `json:"cli_pid"`
 	Status   string    `json:"status"` // idle, running, error
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// PingPongRun 乒乓循环编排运行记录
+type PingPongRun struct {
+	ID            string    `json:"id"`
+	Name          string    `json:"name"`
+	Keywords      []string  `json:"keywords"`
+	AgentAName    string    `json:"agent_a_name"`
+	AgentBName    string    `json:"agent_b_name"`
+	AgentAPrompt  string    `json:"agent_a_prompt"`
+	AgentBPrompt  string    `json:"agent_b_prompt"`
+	Status        string    `json:"status"` // created, running, completed, stopped, error
+	CurrentRound  int       `json:"current_round"`
+	MaxRounds     int       `json:"max_rounds"`
+	StopKeywords  []string  `json:"stop_keywords"`
+	FinalOutput   string    `json:"final_output,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 // MessageLog 消息日志
@@ -131,6 +158,23 @@ func (d *DB) migrate() error {
 	CREATE INDEX IF NOT EXISTS idx_flow_nodes_flow_id ON flow_nodes(flow_id);
 	CREATE INDEX IF NOT EXISTS idx_message_logs_flow_id ON message_logs(flow_id);
 	CREATE INDEX IF NOT EXISTS idx_message_logs_node_id ON message_logs(node_id);
+
+	CREATE TABLE IF NOT EXISTS pingpong_runs (
+		id TEXT PRIMARY KEY,
+		name TEXT NOT NULL,
+		keywords TEXT NOT NULL DEFAULT '[]',
+		agent_a_name TEXT NOT NULL,
+		agent_b_name TEXT NOT NULL,
+		agent_a_prompt TEXT NOT NULL DEFAULT '',
+		agent_b_prompt TEXT NOT NULL DEFAULT '',
+		status TEXT NOT NULL DEFAULT 'created',
+		current_round INTEGER NOT NULL DEFAULT 0,
+		max_rounds INTEGER NOT NULL DEFAULT 100,
+		stop_keywords TEXT NOT NULL DEFAULT '[]',
+		final_output TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+		updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+	);
 	`
 	_, err := d.db.Exec(schema)
 	return err
@@ -406,4 +450,165 @@ func (d *DB) GetMessagesByNodeID(flowID string, nodeID string, limit int) ([]*Me
 		messages = append(messages, &msg)
 	}
 	return messages, rows.Err()
+}
+
+// --- PingPongRun CRUD ---
+
+// CreatePingPongRun 创建乒乓循环运行记录
+func (d *DB) CreatePingPongRun(run *PingPongRun) error {
+	keywordsJSON, err := json.Marshal(run.Keywords)
+	if err != nil {
+		return fmt.Errorf("marshal keywords: %w", err)
+	}
+	stopKeywordsJSON, err := json.Marshal(run.StopKeywords)
+	if err != nil {
+		return fmt.Errorf("marshal stop_keywords: %w", err)
+	}
+
+	_, err = d.db.Exec(
+		"INSERT INTO pingpong_runs (id, name, keywords, agent_a_name, agent_b_name, agent_a_prompt, agent_b_prompt, status, current_round, max_rounds, stop_keywords) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+		run.ID, run.Name, string(keywordsJSON), run.AgentAName, run.AgentBName,
+		run.AgentAPrompt, run.AgentBPrompt, run.Status, run.CurrentRound,
+		run.MaxRounds, string(stopKeywordsJSON),
+	)
+	if err != nil {
+		return fmt.Errorf("insert pingpong run: %w", err)
+	}
+	slog.Info("pingpong run created", "run_id", run.ID, "name", run.Name)
+	return nil
+}
+
+// GetPingPongRun 根据 ID 获取乒乓循环运行记录
+func (d *DB) GetPingPongRun(id string) (*PingPongRun, error) {
+	row := d.db.QueryRow(
+		"SELECT id, name, keywords, agent_a_name, agent_b_name, agent_a_prompt, agent_b_prompt, status, current_round, max_rounds, stop_keywords, final_output, created_at, updated_at FROM pingpong_runs WHERE id = ?",
+		id,
+	)
+	return d.scanPingPongRun(row)
+}
+
+// ListPingPongRuns 列出所有乒乓循环运行记录
+func (d *DB) ListPingPongRuns() ([]*PingPongRun, error) {
+	rows, err := d.db.Query(
+		"SELECT id, name, keywords, agent_a_name, agent_b_name, agent_a_prompt, agent_b_prompt, status, current_round, max_rounds, stop_keywords, final_output, created_at, updated_at FROM pingpong_runs ORDER BY created_at DESC",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("query pingpong runs: %w", err)
+	}
+	defer rows.Close()
+
+	var runs []*PingPongRun
+	for rows.Next() {
+		run, err := d.scanPingPongRunFromRows(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	return runs, rows.Err()
+}
+
+// UpdatePingPongStatus 更新乒乓循环运行状态和当前轮次
+func (d *DB) UpdatePingPongStatus(id string, status string, currentRound int) error {
+	_, err := d.db.Exec(
+		"UPDATE pingpong_runs SET status = ?, current_round = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		status, currentRound, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update pingpong status: %w", err)
+	}
+	slog.Info("pingpong run status updated", "run_id", id, "status", status, "round", currentRound)
+	return nil
+}
+
+// UpdatePingPongFinalOutput 更新乒乓循环最终输出
+func (d *DB) UpdatePingPongFinalOutput(id string, output string) error {
+	_, err := d.db.Exec(
+		"UPDATE pingpong_runs SET final_output = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		output, id,
+	)
+	if err != nil {
+		return fmt.Errorf("update pingpong final output: %w", err)
+	}
+	return nil
+}
+
+// CASPingPongStatus 原子性 CAS 更新：仅当当前状态不是 running 时才更新为 running
+// 返回受影响行数，0 表示已被其他进程抢占或记录不存在
+func (d *DB) CASPingPongStatus(id string, newStatus string, currentRound int) (int64, error) {
+	result, err := d.db.Exec(
+		"UPDATE pingpong_runs SET status = ?, current_round = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status != ?",
+		newStatus, currentRound, id, StatusRunning,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("cas pingpong status: %w", err)
+	}
+	return result.RowsAffected()
+}
+
+// CompletePingPongRun 原子性完成运行：同时更新最终输出和状态，避免中间状态
+func (d *DB) CompletePingPongRun(id string, finalOutput string, currentRound int) error {
+	_, err := d.db.Exec(
+		"UPDATE pingpong_runs SET status = ?, current_round = ?, final_output = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+		StatusCompleted, currentRound, finalOutput, id,
+	)
+	if err != nil {
+		return fmt.Errorf("complete pingpong run: %w", err)
+	}
+	slog.Info("pingpong run completed in db", "run_id", id, "round", currentRound)
+	return nil
+}
+
+// DeletePingPongRun 删除乒乓循环运行记录
+func (d *DB) DeletePingPongRun(id string) error {
+	_, err := d.db.Exec("DELETE FROM pingpong_runs WHERE id = ?", id)
+	if err != nil {
+		return fmt.Errorf("delete pingpong run: %w", err)
+	}
+	slog.Info("pingpong run deleted", "run_id", id)
+	return nil
+}
+
+// scanPingPongRun 从单行查询结果扫描 PingPongRun
+func (d *DB) scanPingPongRun(row *sql.Row) (*PingPongRun, error) {
+	var run PingPongRun
+	var keywordsJSON, stopKeywordsJSON string
+	err := row.Scan(
+		&run.ID, &run.Name, &keywordsJSON, &run.AgentAName, &run.AgentBName,
+		&run.AgentAPrompt, &run.AgentBPrompt, &run.Status, &run.CurrentRound,
+		&run.MaxRounds, &stopKeywordsJSON, &run.FinalOutput,
+		&run.CreatedAt, &run.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("scan pingpong run: %w", err)
+	}
+	if err := json.Unmarshal([]byte(keywordsJSON), &run.Keywords); err != nil {
+		return nil, fmt.Errorf("unmarshal keywords: %w", err)
+	}
+	if err := json.Unmarshal([]byte(stopKeywordsJSON), &run.StopKeywords); err != nil {
+		return nil, fmt.Errorf("unmarshal stop_keywords: %w", err)
+	}
+	return &run, nil
+}
+
+// scanPingPongRunFromRows 从多行查询结果扫描 PingPongRun
+func (d *DB) scanPingPongRunFromRows(rows *sql.Rows) (*PingPongRun, error) {
+	var run PingPongRun
+	var keywordsJSON, stopKeywordsJSON string
+	err := rows.Scan(
+		&run.ID, &run.Name, &keywordsJSON, &run.AgentAName, &run.AgentBName,
+		&run.AgentAPrompt, &run.AgentBPrompt, &run.Status, &run.CurrentRound,
+		&run.MaxRounds, &stopKeywordsJSON, &run.FinalOutput,
+		&run.CreatedAt, &run.UpdatedAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("scan pingpong run row: %w", err)
+	}
+	if err := json.Unmarshal([]byte(keywordsJSON), &run.Keywords); err != nil {
+		return nil, fmt.Errorf("unmarshal keywords: %w", err)
+	}
+	if err := json.Unmarshal([]byte(stopKeywordsJSON), &run.StopKeywords); err != nil {
+		return nil, fmt.Errorf("unmarshal stop_keywords: %w", err)
+	}
+	return &run, nil
 }

@@ -27,6 +27,19 @@ type Config struct {
 	// 日志
 	LogLevel string `yaml:"log_level"`
 	LogFile  string `yaml:"log_file"`
+
+	// 乒乓循环编排
+	PingPong PingPongConfig `yaml:"pingpong"`
+}
+
+// PingPongConfig 乒乓循环编排配置
+type PingPongConfig struct {
+	MaxRounds    int      `yaml:"max_rounds"`
+	StopKeywords []string `yaml:"stop_keywords"`
+	AgentAName   string   `yaml:"agent_a_name"`
+	AgentBName   string   `yaml:"agent_b_name"`
+	AgentAPrompt string   `yaml:"agent_a_prompt"`
+	AgentBPrompt string   `yaml:"agent_b_prompt"`
 }
 
 // DefaultConfig 返回默认配置
@@ -42,6 +55,14 @@ func DefaultConfig() *Config {
 		CLIBinary:        "codebuddy",
 		LogLevel:         "info",
 		LogFile:          "./logs/orch.log",
+		PingPong: PingPongConfig{
+			MaxRounds:    100,
+			StopKeywords: []string{"专利书编写完成", "PATENT_WRITING_DONE"},
+			AgentAName:   "reader",
+			AgentBName:   "writer",
+			AgentAPrompt: "", // 空则使用内置默认 prompt
+			AgentBPrompt: "", // 空则使用内置默认 prompt
+		},
 	}
 }
 
